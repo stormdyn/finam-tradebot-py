@@ -1,28 +1,23 @@
-"""StrategyRunner — wires together MarketDataClient, IStrategy, IOrderExecutor.
+"""src/strategy/runner.py — обвязка MarketData + Strategy + OrderExecutor.
 
-Per-symbol event loop:
-  1. Subscribe to bars + order book
-  2. On bar: call strategy.on_bar(), if Signal → executor.submit()
-  3. On order update: call strategy.on_order_update()
-  4. Handles rollover: watch expiry, reconnect to next contract
-
-Design note: StrategyRunner runs as a single asyncio.Task per symbol.
-It does NOT spawn additional threads; all callbacks are dispatched via
-asyncio.Queue to stay on the event loop.
+Один StrategyRunner на инструмент. Работает как один asyncio.Task.
+События из MD-стримов поступают в asyncio.Queue (аналог C++ EventBus/SPSCQueue).
 """
 from __future__ import annotations
-
 import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from core.domain import Bar, OrderBook, OrderRequest, OrderSide, OrderUpdate, Signal, SignalDirection, Symbol
-from core.errors import FinamError
+from core.domain import (
+    Bar, OrderBook, OrderRequest, OrderSide,
+    OrderUpdate, Signal, SignalDirection, Symbol,
+)
+from core.errors import AppError
 from core.interfaces import IOrderExecutor, IRiskManager, IStrategy
 from api.market_data import MarketDataClient
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -33,11 +28,10 @@ class RunnerConfig:
     sl_ticks: float = 30.0
     tp_ticks: float = 90.0
     timeframe: str = "M1"
-    poll_interval_ms: int = 100
 
 
 class StrategyRunner:
-    """Per-symbol runner. Instantiate one per instrument."""
+    """Per-symbol event loop: MD → Strategy → Executor."""
 
     def __init__(
         self,
@@ -51,9 +45,12 @@ class StrategyRunner:
         self._md = md
         self._executor = executor
         self._risk = risk
-        self._queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
+        # asyncio.Queue как event bus (аналог C++ SPSCQueue<MarketEvent>)
+        # Trade-off: Queue vs lock-free SPSC:
+        #   asyncio однопоточен — data races невозможны, Queue даёт
+        #   чистый async API и легко тестируется.
+        self._queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue(maxsize=1024)
 
-        # Default strategy: ConfluenceStrategy
         if strategy is None:
             from strategy.confluence import ConfluenceStrategy, ConfluenceConfig  # noqa: PLC0415
             strategy = ConfluenceStrategy(ConfluenceConfig(
@@ -67,22 +64,20 @@ class StrategyRunner:
 
     async def run(self, stop: asyncio.Event) -> None:
         sym = self._cfg.symbol
-        log.info("StrategyRunner starting: %s", sym)
+        logger.info("[Runner] starting: %s", sym)
 
-        # Bar subscription feeds events into the queue
         bar_task = asyncio.create_task(
             self._md.subscribe_bars(
                 sym, self._cfg.timeframe,
-                callback=lambda b: self._queue.put_nowait(("bar", b)),
+                callback=lambda b: self._put("bar", b),
                 stop_event=stop,
             ),
             name=f"bars-{sym.security_code}",
         )
-
         book_task = asyncio.create_task(
             self._md.subscribe_orderbook(
                 sym,
-                callback=lambda ob: self._queue.put_nowait(("book", ob)),
+                callback=lambda ob: self._put("book", ob),
                 stop_event=stop,
             ),
             name=f"book-{sym.security_code}",
@@ -96,7 +91,6 @@ class StrategyRunner:
                     )
                 except asyncio.TimeoutError:
                     continue
-
                 await self._dispatch(event_type, payload)
         except asyncio.CancelledError:
             pass
@@ -104,16 +98,26 @@ class StrategyRunner:
             bar_task.cancel()
             book_task.cancel()
             await asyncio.gather(bar_task, book_task, return_exceptions=True)
-            log.info("StrategyRunner stopped: %s", sym)
+            logger.info("[Runner] stopped: %s", sym)
 
-    async def _dispatch(self, event_type: str, payload) -> None:
+    def _put(self, event_type: str, payload: object) -> None:
+        """Положить событие в очередь без блокировки. Дроп при переполнении."""
+        try:
+            self._queue.put_nowait((event_type, payload))
+        except asyncio.QueueFull:
+            logger.warning("[Runner] %s: event queue full, dropping %s", self._cfg.symbol, event_type)
+
+    async def _dispatch(self, event_type: str, payload: object) -> None:
         if event_type == "bar":
+            assert isinstance(payload, Bar)
             signal = self._strategy.on_bar(payload)
             await self._handle_signal(signal)
         elif event_type == "book":
+            assert isinstance(payload, OrderBook)
             if hasattr(self._strategy, "on_order_book"):
-                self._strategy.on_order_book(payload)
+                self._strategy.on_order_book(payload)  # type: ignore[attr-defined]
         elif event_type == "order_update":
+            assert isinstance(payload, OrderUpdate)
             self._strategy.on_order_update(payload)
 
     async def _handle_signal(self, signal: Signal) -> None:
@@ -133,15 +137,15 @@ class StrategyRunner:
         )
         try:
             local_id = await self._executor.submit(req)
-            log.info(
-                "[%s] Signal %s → order local_id=%d reason=%s",
-                self._strategy.name, signal.direction, local_id, signal.reason,
+            logger.info(
+                "[Runner] %s signal %s → order local_id=%d reason=%s",
+                self._strategy.name, signal.direction.name, local_id, signal.reason,
             )
-        except FinamError as e:
-            log.warning("[%s] Order rejected: %s", self._strategy.name, e)
+        except AppError as e:
+            logger.warning("[Runner] %s order rejected: %s", self._strategy.name, e)
 
     def make_order_callback(self) -> object:
-        """Returns a callback to feed OrderUpdates back into this runner."""
+        """Колбэк для подачи OrderUpdate из OrderExecutor в эту стратегию."""
         def _cb(upd: OrderUpdate) -> None:
-            self._queue.put_nowait(("order_update", upd))
+            self._put("order_update", upd)
         return _cb

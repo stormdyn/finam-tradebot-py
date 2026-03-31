@@ -1,21 +1,12 @@
-"""Application — top-level async event loop for the trading bot.
+"""src/app/application.py — точка входа asyncio event loop (аналог C++ main.cpp).
 
-Responsibilities:
-  - Bootstrap auth, risk, market-data, order executor
-  - Launch per-symbol StrategyRunner tasks
-  - Handle SIGINT/SIGTERM → graceful shutdown
-  - Wait through maintenance windows before starting streams
+Жизненный цикл:
+  INIT → CONNECTING → RUNNING → STOPPING → STOPPED
 
-Usage::
-
-    import asyncio
-    from app.application import Application
-    from config import AppConfig
-
-    asyncio.run(Application(AppConfig()).run())
+Graceful shutdown:
+  SIGINT/SIGTERM → stop_event.set() → отмена всех Task → закрытие канала.
 """
 from __future__ import annotations
-
 import asyncio
 import logging
 import os
@@ -25,13 +16,13 @@ from typing import Optional
 
 from auth.manager import AuthManager
 from core.contract import nearest_contract
-from core.errors import FinamError
+from core.errors import AppError
 from core.maintenance import wait_if_maintenance
 from risk.manager import RiskConfig, RiskManager
 from api.market_data import MarketDataClient
 from api.order_client import DryRunExecutor, OrderExecutor
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -61,52 +52,54 @@ class AppConfig:
 
 
 class Application:
-    """Async application lifecycle manager.
-
-    State machine (informal)::
-
-        INIT → CONNECTING → RUNNING → STOPPING → STOPPED
-    """
+    """Главный класс приложения."""
 
     def __init__(self, config: AppConfig) -> None:
         self._cfg = config
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._auth: Optional[AuthManager] = None
+        self._risk: Optional[RiskManager] = None
+        self._executor: Optional[OrderExecutor] = None
 
     async def run(self) -> None:
-        """Entry point: initialise everything and run until signal."""
+        """Точка входа: инициализация, запуск, ожидание сигнала."""
         secret = os.environ.get("FINAM_SECRET_TOKEN", "")
         if not secret:
             raise RuntimeError("FINAM_SECRET_TOKEN env var is not set")
 
-        # ── Auth ────────────────────────────────────────────────────────
+        # ── Auth ─────────────────────────────────────────────────────────
         auth = AuthManager(self._cfg.endpoint, self._cfg.use_tls)
         await auth.init(secret)
-        secret = ""  # zero-out ASAP — Python str is immutable but at least clears local ref
+        secret = ""  # убираем ссылку на секрет как можно раньше
         self._auth = auth
 
-        # ── Risk ────────────────────────────────────────────────────────
+        # ── Risk ─────────────────────────────────────────────────────────
         risk = RiskManager(self._cfg.risk, auth)
         await risk.start()
+        self._risk = risk
 
-        # ── Market data ─────────────────────────────────────────────────
+        # ── Market data ──────────────────────────────────────────────────
         md = MarketDataClient(auth)
 
-        # ── Order executor ──────────────────────────────────────────────
+        # ── Order executor ───────────────────────────────────────────────
         if self._cfg.dry_run:
-            log.warning("DRY-RUN mode: orders will NOT be sent to the exchange")
+            logger.warning("DRY-RUN mode: orders will NOT be sent to the exchange")
             executor = DryRunExecutor()
         else:
             order_exec = OrderExecutor(auth, risk)
             await order_exec.start()
+            self._executor = order_exec
             executor = order_exec
 
-        # ── Wait through any active maintenance window ───────────────────
+        # ── Ждём конца техобслуживания ───────────────────────────────────
         await wait_if_maintenance(self._stop)
+        if self._stop.is_set():
+            await self._shutdown()
+            return
 
-        # ── Strategy runners ─────────────────────────────────────────────
-        from strategy.runner import StrategyRunner, RunnerConfig  # noqa: PLC0415 (lazy, avoids circular)
+        # ── Стратегии ────────────────────────────────────────────────────
+        from strategy.runner import StrategyRunner, RunnerConfig  # noqa: PLC0415
 
         for sym_cfg in self._cfg.symbols:
             symbol = nearest_contract(sym_cfg.ticker, sym_cfg.rollover_days)
@@ -128,40 +121,33 @@ class Application:
             )
             self._tasks.append(task)
 
-        # ── Signal handlers ──────────────────────────────────────────────
+        # ── SIGINT / SIGTERM ─────────────────────────────────────────────
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, self._on_signal)
+            loop.add_signal_handler(sig, self._stop.set)
 
-        log.info(
+        logger.info(
             "Bot running — %d instruments, dry_run=%s",
             len(self._tasks), self._cfg.dry_run,
         )
 
-        # ── Main wait ────────────────────────────────────────────────────
         await self._stop.wait()
-        await self._shutdown(executor if not self._cfg.dry_run else None, risk)
+        await self._shutdown()
 
-    def _on_signal(self) -> None:
-        log.info("Shutdown signal received")
-        self._stop.set()
-
-    async def _shutdown(
-        self,
-        executor: Optional[OrderExecutor],
-        risk: RiskManager,
-    ) -> None:
-        log.info("Shutting down %d runners...", len(self._tasks))
+    async def _shutdown(self) -> None:
+        logger.info("Shutting down %d runners...", len(self._tasks))
         for t in self._tasks:
             t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
-        if executor is not None:
-            await executor.stop()
+        if self._executor is not None:
+            await self._executor.stop()
 
-        await risk.stop()
+        if self._risk is not None:
+            await self._risk.stop()
 
         if self._auth is not None:
-            await self._auth.channel.close()
+            await self._auth.shutdown()
 
-        log.info("finam-tradebot stopped")
+        logger.info("finam-tradebot stopped")

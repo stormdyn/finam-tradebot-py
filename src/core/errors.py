@@ -1,59 +1,41 @@
-"""src/core/errors.py — Классификация ошибок (аналог core/interfaces.hpp ErrorCode)"""
+"""src/core/errors.py — классификация ошибок (аналог C++ ErrorCode + Error)"""
 from __future__ import annotations
 from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Optional, TypeVar, Union
+from enum import IntEnum
+from typing import Optional
 
 
-class ErrorCode(Enum):
+class ErrorCode(IntEnum):
     # Network / gRPC
-    CONNECTION_FAILED = auto()
-    STREAM_DISCONNECTED = auto()
-    TIMEOUT = auto()
-    RPC_ERROR = auto()
-    
+    CONNECTION_FAILED = 100
+    STREAM_DISCONNECTED = 101
+    TIMEOUT = 102
+    RPC_ERROR = 103
     # Order
-    ORDER_REJECTED = auto()
-    INSUFFICIENT_MARGIN = auto()
-    INVALID_PRICE = auto()
-    INVALID_QUANTITY = auto()
-    
+    ORDER_REJECTED = 200
+    INSUFFICIENT_MARGIN = 201
+    INVALID_PRICE = 202
+    INVALID_QUANTITY = 203
     # Risk
-    RISK_LIMIT_EXCEEDED = auto()
-    DAILY_LOSS_LIMIT_HIT = auto()
-    
+    RISK_LIMIT_EXCEEDED = 300
+    DAILY_LOSS_LIMIT_HIT = 301
     # Generic
-    INVALID_ARGUMENT = auto()
-    NOT_IMPLEMENTED = auto()
-    INTERNAL = auto()
+    INVALID_ARGUMENT = 400
+    NOT_IMPLEMENTED = 401
+    INTERNAL = 500
 
 
-@dataclass
-class AppError:
-    """Структурированная ошибка (аналог C++ Error)"""
-    code: ErrorCode
-    message: str
-    details: Optional[dict[str, object]] = None
-    
+class AppError(Exception):
+    """Структурированная ошибка. Используется через raise, не как Result-тип."""
+
+    def __init__(self, code: ErrorCode, message: str, details: Optional[dict] = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
     def __str__(self) -> str:
         base = f"{self.code.name}: {self.message}"
         if self.details:
             base += f" | {self.details}"
         return base
-
-
-# ── Result-тип для явной обработки ошибок (аналог std::expected) ─────────────
-
-T = TypeVar("T")
-Result = Union[T, AppError]
-
-
-def is_ok(result: Result) -> bool:
-    """Проверка: результат успешен (не AppError)"""
-    return not isinstance(result, AppError)
-
-def unwrap(result: Result[T]) -> T:  # Result уже имеет TypeVar T
-    """Получить значение или выбросить исключение."""
-    if isinstance(result, AppError):
-        raise RuntimeError(f"Unwrap failed: {result}")
-    return result

@@ -1,10 +1,9 @@
-"""src/core/types.py — Базовые типы данных (аналог core/interfaces.hpp)"""
+"""src/core/domain.py — базовые типы данных (аналог C++ core/interfaces.hpp structs)"""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from typing import Literal
-from decimal import Decimal
 
 
 class OrderSide(Enum):
@@ -27,18 +26,25 @@ class OrderType(Enum):
     STOP_LIMIT = "stop_limit"
 
 
+class SignalDirection(Enum):
+    BUY = auto()
+    SELL = auto()
+    CLOSE = auto()
+    NONE = auto()
+
+
 @dataclass(frozen=True)
 class Symbol:
     """
     Формат Finam API v2: {SECURITY_CODE}@{SECURITY_BOARD}
-    Примеры из C++ connectivity_check: SiM6@RTSX, RIM6@RTSX
+    Примеры: Si-6.26@FORTS, RTS-6.26@FORTS
     """
-    security_code: str   # "SiM6", "Si-6.26" — зависит от API
-    security_board: str  # "RTSX" или "FORTS"
-    
+    security_code: str
+    security_board: str = "FORTS"
+
     def __str__(self) -> str:
         return f"{self.security_code}@{self.security_board}"
-    
+
     @classmethod
     def from_forts(cls, ticker: str, month: int, year: int) -> Symbol:
         """Si, 6, 2026 → Symbol('Si-6.26', 'FORTS')"""
@@ -47,7 +53,6 @@ class Symbol:
 
 @dataclass
 class Quote:
-    """Котировка (bid/ask/last)"""
     symbol: Symbol
     bid: float
     ask: float
@@ -58,38 +63,35 @@ class Quote:
 
 @dataclass
 class Bar:
-    """Свеча с таймфреймом (как в C++ Bar::timeframe)"""
     symbol: Symbol
-    timeframe: Literal["M1", "M5", "M15", "M30", "H1", "H4", "D1", "W1"]
+    timeframe: str  # "M1", "M5", "H1", "D1" ...
     open: float
     high: float
     low: float
     close: float
     volume: int
     ts: datetime = field(default_factory=datetime.utcnow)
-    date: str = ""  # YYYY-MM-DD для бэктеста
+    date: str = ""
 
 
 @dataclass
 class OrderBookRow:
-    """Уровень стакана"""
     price: float
     quantity: int
 
 
 @dataclass
 class OrderBook:
-    """Снапшот стакана"""
     symbol: Symbol
     bids: list[OrderBookRow] = field(default_factory=list)
     asks: list[OrderBookRow] = field(default_factory=list)
     ts: datetime = field(default_factory=datetime.utcnow)
 
+
 @dataclass
 class OrderUpdate:
-    """Уведомление об изменении ордера (из SubscribeOrders)"""
-    order_no: int          # биржевой ID (64-bit в C++)
-    transaction_id: int    # локальный ID для трекинга
+    order_no: int
+    transaction_id: int
     symbol: Symbol
     client_id: str
     side: OrderSide
@@ -102,14 +104,12 @@ class OrderUpdate:
     ts: datetime = field(default_factory=datetime.utcnow)
 
 
-
 @dataclass
 class OrderRequest:
-    """Запрос на выставление ордера"""
     client_id: str
     symbol: Symbol
     side: OrderSide
-    type: OrderType = OrderType.MARKET
+    order_type: OrderType = OrderType.MARKET
     price: float = 0.0
     quantity: int = 0
 
@@ -118,37 +118,26 @@ class OrderRequest:
 class Signal:
     """
     Сигнал от стратегии (аналог C++ Signal).
-    direction=None → нет сигнала.
+    direction=NONE → нет сигнала.
     """
-    class Direction(Enum):
-        BUY = auto()
-        SELL = auto()
-        CLOSE = auto()
-        NONE = auto()
-    
     symbol: Symbol
-    direction: Direction = Direction.NONE
+    direction: SignalDirection = SignalDirection.NONE
     order_type: OrderType = OrderType.MARKET
     price: float = 0.0
     quantity: int = 0
     reason: str = ""
-    
+
     def is_entry(self) -> bool:
-        return self.direction in (self.Direction.BUY, self.Direction.SELL)
-    
+        return self.direction in (SignalDirection.BUY, SignalDirection.SELL)
+
     def is_exit(self) -> bool:
-        return self.direction == self.Direction.CLOSE
+        return self.direction == SignalDirection.CLOSE
 
-
-# ── События для стратегии (OFI pipeline) ──────────────────────────────────────
 
 @dataclass
 class BookLevelEvent:
-    """
-    Дельта уровня стакана (аналог C++ BookLevelEvent).
-    Вызывается на каждое изменение уровня 0..4.
-    """
-    level: int           # 0-based, 0 = лучший уровень
+    """Дельта уровня стакана (аналог C++ BookLevelEvent)."""
+    level: int
     price: float
     old_bid_size: float
     new_bid_size: float
@@ -159,8 +148,8 @@ class BookLevelEvent:
 
 @dataclass
 class TradeEvent:
-    """Исполненная сделка (из SubscribeLatestTrades)"""
+    """Исполненная сделка из SubscribeLatestTrades."""
     price: float
     volume: float
-    is_buy: bool         # true = buyer-initiated (hit ask)
+    is_buy: bool
     ts: datetime = field(default_factory=datetime.utcnow)
